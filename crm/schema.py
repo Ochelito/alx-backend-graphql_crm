@@ -1,32 +1,111 @@
 import re
 import graphene
 from graphene_django import DjangoObjectType
+from graphene_django.filter import DjangoFilterConnectionField
 from django.db import transaction
 from django.core.validators import validate_email
-from django.core.exceptions import ValidationError, ObjectDoesNotExist
+from django.core.exceptions import ValidationError
 
 from .models import Customer, Product, Order
+import django_filters
 
 # ============================================================
-# OBJECT TYPES
+# FILTERS
 # ============================================================
 
-class CustomerType(DjangoObjectType):
+class CustomerFilter(django_filters.FilterSet):
+    name_icontains = django_filters.CharFilter(field_name="name", lookup_expr="icontains")
+    email_icontains = django_filters.CharFilter(field_name="email", lookup_expr="icontains")
+    created_at_gte = django_filters.DateFilter(field_name="created_at", lookup_expr="gte")
+    created_at_lte = django_filters.DateFilter(field_name="created_at", lookup_expr="lte")
+    phone_pattern = django_filters.CharFilter(method="filter_phone_pattern")
+    order_by = django_filters.OrderingFilter(
+        fields=(
+            ('name', 'name'),
+            ('email', 'email'),
+            ('created_at', 'created_at'),
+        )
+    )
+
     class Meta:
         model = Customer
-        fields = ("id", "name", "email", "phone")
+        fields = []
+
+    def filter_phone_pattern(self, queryset, name, value):
+        return queryset.filter(phone__startswith=value)
 
 
-class ProductType(DjangoObjectType):
+class ProductFilter(django_filters.FilterSet):
+    name_icontains = django_filters.CharFilter(field_name="name", lookup_expr="icontains")
+    price_gte = django_filters.NumberFilter(field_name="price", lookup_expr="gte")
+    price_lte = django_filters.NumberFilter(field_name="price", lookup_expr="lte")
+    stock_gte = django_filters.NumberFilter(field_name="stock", lookup_expr="gte")
+    stock_lte = django_filters.NumberFilter(field_name="stock", lookup_expr="lte")
+    order_by = django_filters.OrderingFilter(
+        fields=(
+            ('name', 'name'),
+            ('price', 'price'),
+            ('stock', 'stock'),
+        )
+    )
+
+    class Meta:
+        model = Product
+        fields = []
+
+
+class OrderFilter(django_filters.FilterSet):
+    total_amount_gte = django_filters.NumberFilter(field_name="total_amount", lookup_expr="gte")
+    total_amount_lte = django_filters.NumberFilter(field_name="total_amount", lookup_expr="lte")
+    order_date_gte = django_filters.DateFilter(field_name="order_date", lookup_expr="gte")
+    order_date_lte = django_filters.DateFilter(field_name="order_date", lookup_expr="lte")
+    customer_name = django_filters.CharFilter(field_name="customer__name", lookup_expr="icontains")
+    product_name = django_filters.CharFilter(method="filter_product_name")
+    product_id = django_filters.NumberFilter(method="filter_product_id")
+    order_by = django_filters.OrderingFilter(
+        fields=(
+            ('total_amount', 'total_amount'),
+            ('order_date', 'order_date'),
+        )
+    )
+
+    class Meta:
+        model = Order
+        fields = []
+
+    def filter_product_name(self, queryset, name, value):
+        return queryset.filter(products__name__icontains=value)
+
+    def filter_product_id(self, queryset, name, value):
+        return queryset.filter(products__id=value)
+
+
+# ============================================================
+# OBJECT TYPES (GraphQL Nodes)
+# ============================================================
+
+class CustomerNode(DjangoObjectType):
+    class Meta:
+        model = Customer
+        fields = ("id", "name", "email", "phone", "created_at")
+        filterset_class = CustomerFilter
+        interfaces = (graphene.relay.Node,)
+
+
+class ProductNode(DjangoObjectType):
     class Meta:
         model = Product
         fields = ("id", "name", "price", "stock")
+        filterset_class = ProductFilter
+        interfaces = (graphene.relay.Node,)
 
 
-class OrderType(DjangoObjectType):
+class OrderNode(DjangoObjectType):
     class Meta:
         model = Order
         fields = ("id", "customer", "products", "total_amount", "order_date")
+        filterset_class = OrderFilter
+        interfaces = (graphene.relay.Node,)
 
 
 # ============================================================
@@ -40,17 +119,15 @@ class CustomerInput(graphene.InputObjectType):
 
 
 # ============================================================
-# VALIDATION FUNCTION
+# VALIDATION
 # ============================================================
 
 def validate_email_and_phone(email, phone=None):
-    # Email validation
     try:
         validate_email(email)
     except ValidationError:
         return "Invalid email format"
 
-    # Phone validation (optional)
     if phone:
         pattern = r'^(\+?\d{10,15}|(\d{3}-\d{3}-\d{4}))$'
         if not re.match(pattern, phone):
@@ -63,7 +140,7 @@ def validate_email_and_phone(email, phone=None):
 # ============================================================
 
 class CreateCustomer(graphene.Mutation):
-    customer = graphene.Field(CustomerType)
+    customer = graphene.Field(CustomerNode)
     message = graphene.String()
     error = graphene.String()
 
@@ -71,29 +148,19 @@ class CreateCustomer(graphene.Mutation):
         input = CustomerInput(required=True)
 
     def mutate(self, info, input):
-        # Validate email & phone
         error = validate_email_and_phone(input.email, input.phone)
         if error:
             return CreateCustomer(error=error)
-
-        # Check unique email
         if Customer.objects.filter(email=input.email).exists():
             return CreateCustomer(error="Email already exists")
-
-        # Create and save customer
-        customer = Customer(
-            name=input.name,
-            email=input.email,
-            phone=input.phone or ""
-        )
-        customer.full_clean()  # optional field validation
-        customer.save()        # persist to DB
-
+        customer = Customer(name=input.name, email=input.email, phone=input.phone or "")
+        customer.full_clean()
+        customer.save()
         return CreateCustomer(customer=customer, message="Customer created successfully")
 
 
 class BulkCreateCustomers(graphene.Mutation):
-    customers = graphene.List(CustomerType)
+    customers = graphene.List(CustomerNode)
     errors = graphene.List(graphene.String)
 
     class Arguments:
@@ -103,36 +170,26 @@ class BulkCreateCustomers(graphene.Mutation):
     def mutate(self, info, input):
         created = []
         errors = []
-
         for idx, c in enumerate(input):
-            # Validate email & phone
             error = validate_email_and_phone(c.email, c.phone)
             if error:
                 errors.append(f"[{idx}] {error}")
                 continue
-            # Check unique email
             if Customer.objects.filter(email=c.email).exists():
                 errors.append(f"[{idx}] Email already exists: {c.email}")
                 continue
-
-            # Create and save customer
-            customer = Customer(
-                name=c.name,
-                email=c.email,
-                phone=c.phone or ""
-            )
+            customer = Customer(name=c.name, email=c.email, phone=c.phone or "")
             try:
                 customer.full_clean()
                 customer.save()
                 created.append(customer)
             except Exception as e:
                 errors.append(f"[{idx}] {str(e)}")
-
         return BulkCreateCustomers(customers=created, errors=errors)
 
 
 class CreateProduct(graphene.Mutation):
-    product = graphene.Field(ProductType)
+    product = graphene.Field(ProductNode)
     error = graphene.String()
 
     class Arguments:
@@ -145,14 +202,13 @@ class CreateProduct(graphene.Mutation):
             return CreateProduct(error="Price must be positive")
         if stock < 0:
             return CreateProduct(error="Stock cannot be negative")
-
         product = Product(name=name, price=price, stock=stock)
-        product.save()  # persist
+        product.save()
         return CreateProduct(product=product)
 
 
 class CreateOrder(graphene.Mutation):
-    order = graphene.Field(OrderType)
+    order = graphene.Field(OrderNode)
     error = graphene.String()
 
     class Arguments:
@@ -161,19 +217,14 @@ class CreateOrder(graphene.Mutation):
 
     @transaction.atomic
     def mutate(self, info, customer_id, product_ids):
-        # Validate customer
         try:
             customer = Customer.objects.get(id=customer_id)
         except Customer.DoesNotExist:
             return CreateOrder(error="Invalid customer ID")
-
         if not product_ids:
             return CreateOrder(error="At least one product is required")
-
         products = []
         total_amount = 0
-
-        # Validate products
         for pid in product_ids:
             try:
                 product = Product.objects.get(id=pid)
@@ -181,12 +232,9 @@ class CreateOrder(graphene.Mutation):
                 total_amount += product.price
             except Product.DoesNotExist:
                 return CreateOrder(error=f"Invalid product ID: {pid}")
-
-        # Create and save order
         order = Order(customer=customer, total_amount=total_amount)
-        order.save()           # must save before setting M2M
-        order.products.set(products)  # associate products
-
+        order.save()
+        order.products.set(products)
         return CreateOrder(order=order)
 
 
@@ -207,18 +255,10 @@ class Mutation(graphene.ObjectType):
 
 class Query(graphene.ObjectType):
     hello = graphene.String(default_value="Hello, GraphQL!")
-    customers = graphene.List(CustomerType)
-    products = graphene.List(ProductType)
-    orders = graphene.List(OrderType)
 
-    def resolve_customers(root, info):
-        return Customer.objects.all()
-
-    def resolve_products(root, info):
-        return Product.objects.all()
-
-    def resolve_orders(root, info):
-        return Order.objects.all()
+    all_customers = DjangoFilterConnectionField(CustomerNode)
+    all_products = DjangoFilterConnectionField(ProductNode)
+    all_orders = DjangoFilterConnectionField(OrderNode)
 
 
 # ============================================================

@@ -6,7 +6,7 @@ from django.db import transaction
 from django.core.validators import validate_email
 from django.core.exceptions import ValidationError
 
-from crm.models import Customer, Product, Order
+from crm.models import Product, Customer, Order
 import django_filters
 
 # ============================================================

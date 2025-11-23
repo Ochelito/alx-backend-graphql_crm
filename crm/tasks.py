@@ -2,6 +2,7 @@ from celery import shared_task
 from datetime import datetime
 from gql import gql, Client
 from gql.transport.requests import RequestsHTTPTransport
+import requests
 
 @shared_task
 def generate_crm_report():
